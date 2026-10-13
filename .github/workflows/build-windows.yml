@@ -1,0 +1,94 @@
+name: Build nvbandwidth Windows RTX50
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out NVIDIA nvbandwidth v0.10.0
+        uses: actions/checkout@v4
+        with:
+          repository: NVIDIA/nvbandwidth
+          ref: v0.10.0
+          path: source
+
+      - name: Install NVIDIA CUDA Toolkit 12.8.1
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "nvml_dev", "visual_studio_integration"]'
+
+      - name: Inspect CUDA toolchain and libraries
+        shell: pwsh
+        run: |
+          nvcc --version
+          cmake --version
+          Write-Host "CUDA_PATH=$env:CUDA_PATH"
+          if (-not $env:CUDA_PATH) { throw 'CUDA_PATH is not set' }
+          foreach ($file in @('cuda.lib', 'nvml.lib')) {
+            $matches = @(Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter $file -ErrorAction SilentlyContinue)
+            if ($matches.Count -eq 0) { throw "$file not found in the CUDA Toolkit installation" }
+            $matches | Select-Object -ExpandProperty FullName
+          }
+
+      - name: Configure and compile for sm_120
+        shell: pwsh
+        run: |
+          $libDirs = @(Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter 'nvml.lib' -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.DirectoryName })
+          $libDirs += @(Get-ChildItem -Path $env:CUDA_PATH -Recurse -File -Filter 'cuda.lib' -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.DirectoryName })
+          $libDirs = @($libDirs | Select-Object -Unique)
+          $env:LIB = (($libDirs + @($env:LIB)) -join ';')
+
+          cmake -S source -B build `
+            -G 'Visual Studio 17 2022' -A x64 `
+            -DCMAKE_CUDA_ARCHITECTURES=120 `
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Static
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+
+          cmake --build build --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'CMake build failed' }
+
+          $exe = Get-ChildItem -Path build -Recurse -File -Filter 'nvbandwidth.exe' |
+            Where-Object { $_.FullName -match 'Release' } |
+            Select-Object -First 1
+          if (-not $exe) { throw 'Compiled nvbandwidth.exe was not found' }
+
+          New-Item -Path dist -ItemType Directory -Force | Out-Null
+          Copy-Item $exe.FullName -Destination 'dist/nvbandwidth.exe'
+
+          # Static CUDA runtime is requested. Include a CUDA runtime DLL only
+          # as a fallback if the executable is linked against a dynamic runtime.
+          $cudart = Join-Path $env:CUDA_PATH 'bin/cudart64_12.dll'
+          if (Test-Path $cudart) { Copy-Item $cudart -Destination dist }
+
+          Get-FileHash 'dist/nvbandwidth.exe' -Algorithm SHA256 |
+            Format-List | Out-String | Set-Content 'dist/SHA256.txt'
+          @'
+          nvbandwidth v0.10.0 | Windows x64 | CUDA 12.8.1 | sm_120
+          Intended GPU: NVIDIA RTX 50 series (including RTX 5080 Laptop / 5070 Ti Laptop).
+          On the target Windows PC, install a compatible NVIDIA display driver.
+          From PowerShell in this directory:
+            .\nvbandwidth.exe --version
+            .\nvbandwidth.exe -l
+            .\nvbandwidth.exe -t host_to_device_memcpy_ce device_to_host_memcpy_ce -i 10 -b 512
+          No GPU benchmark is run during GitHub Actions compilation.
+          If Windows reports missing MSVC runtime, install the x64 VC++ Redistributable.
+          '@ | Set-Content 'dist/README.txt'
+
+      - name: Upload portable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvbandwidth-v0.10.0-Windows-sm120
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
